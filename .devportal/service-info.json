@@ -1,8 +1,0 @@
-{
-  "service_name": "nodejs-tesst-1",
-  "framework": "nodejs",
-  "docker_image": "ghcr.io/quancv2k4/nodejs_tesst",
-  "repo_a_url": "https://github.com/quancv2k4/nodejs_tesst.git",
-  "repo_b_url": "https://github.com/quanmbl4255142/repository_b_ci_cd_fpt_repob_devops",
-  "created_at": "2025-10-30T08:04:25.625942"
-}
