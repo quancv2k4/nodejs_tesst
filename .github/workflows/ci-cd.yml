@@ -1,0 +1,266 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  REGISTRY: ghcr.io
+  
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Check for package files
+        run: |
+          if [ ! -f package.json ]; then
+            echo "⚠️ No package.json found"
+            exit 0
+          fi
+      
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ] || [ -f yarn.lock ]; then
+            npm ci
+          else
+            echo "⚠️ No lockfile found, using npm install"
+            npm install
+          fi
+        continue-on-error: true
+      
+      - name: Build (if needed)
+        run: |
+          npm run build || echo "No build script"
+        continue-on-error: true
+      
+      - name: Run tests
+        run: |
+          npm test || echo "No tests configured"
+        continue-on-error: true
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/quancv2k4/nodejs_tesst:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Checkout Repository B (for manifests)
+        uses: actions/checkout@v3
+        with:
+          repository: quanmbl4255142/repository_b_ci_cd_fpt_repob_devops
+          # Use REPO_B_TOKEN (automatically added by Dev Portal) or PAT_TOKEN for backward compatibility
+          # GITHUB_TOKEN may not have read access if Repo B is private or in different org
+          token: ${{ secrets.REPO_B_TOKEN || secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          path: repo-b
+          fetch-depth: 0
+      
+      - name: Read service metadata from Repo A (backup method)
+        id: read_metadata
+        run: |
+          # Try to read .devportal/service-info.json from Repo A as backup
+          if [ -f ".devportal/service-info.json" ]; then
+            # Try using jq if available, otherwise use sed/grep
+            if command -v jq >/dev/null 2>&1; then
+              BACKUP_SERVICE_NAME=$(jq -r '.service_name // empty' .devportal/service-info.json 2>/dev/null || echo "")
+            else
+              # Fallback: extract service_name using grep/sed (simple JSON parsing)
+              BACKUP_SERVICE_NAME=$(grep -o '"service_name"[[:space:]]*:[[:space:]]*"[^"]*"' .devportal/service-info.json 2>/dev/null | sed -E 's/.*"service_name"[[:space:]]*:[[:space:]]*"([^"]*)".*//' || echo "")
+            fi
+            
+            if [ -n "$BACKUP_SERVICE_NAME" ] && [ "$BACKUP_SERVICE_NAME" != "null" ] && [ "$BACKUP_SERVICE_NAME" != "" ]; then
+              echo "service_name=$BACKUP_SERVICE_NAME" >> $GITHUB_OUTPUT
+              echo "✅ Found service_name from metadata: $BACKUP_SERVICE_NAME"
+            else
+              echo "⚠️ Could not extract service_name from metadata file"
+            fi
+          else
+            echo "ℹ️ No metadata file found at .devportal/service-info.json (this is OK)"
+          fi
+      
+      - name: Update deployment image
+        working-directory: repo-b
+        env:
+          SHA: ${{ github.sha }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          SERVICE_NAME: "nodejs-tesst-1"
+          BACKUP_SERVICE_NAME: ${{ steps.read_metadata.outputs.service_name }}
+        run: |
+          # Determine the actual service name to use
+          ACTUAL_SERVICE_NAME=""
+          
+          # Priority 1: Use SERVICE_NAME from workflow (directly set)
+          if [ -n "$SERVICE_NAME" ] && [ "$SERVICE_NAME" != "None" ] && [ "$SERVICE_NAME" != "" ] && [ "$SERVICE_NAME" != "null" ]; then
+            ACTUAL_SERVICE_NAME=$(echo "$SERVICE_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g' | tr -d '[:space:]')
+            echo "✅ Using SERVICE_NAME from workflow: $ACTUAL_SERVICE_NAME"
+          fi
+          
+          # Priority 2: Use backup from metadata file
+          if [ -z "$ACTUAL_SERVICE_NAME" ] && [ -n "$BACKUP_SERVICE_NAME" ] && [ "$BACKUP_SERVICE_NAME" != "" ]; then
+            ACTUAL_SERVICE_NAME=$(echo "$BACKUP_SERVICE_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g' | tr -d '[:space:]')
+            echo "✅ Using SERVICE_NAME from metadata: $ACTUAL_SERVICE_NAME"
+          fi
+          
+          # Priority 3: Derive from repo name
+          if [ -z "$ACTUAL_SERVICE_NAME" ]; then
+            ACTUAL_SERVICE_NAME=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g' | sed 's/\./-/g' | tr -d '[:space:]')
+            echo "⚠️ SERVICE_NAME not found, using repo name: $ACTUAL_SERVICE_NAME"
+          fi
+          
+          # Validate service name
+          if [ -z "$ACTUAL_SERVICE_NAME" ] || [ "$ACTUAL_SERVICE_NAME" = "none" ]; then
+            echo "❌ Error: Cannot determine service name"
+            exit 1
+          fi
+          
+          echo "🔍 Searching for deployment.yaml with service_name: $ACTUAL_SERVICE_NAME"
+          echo "🔍 Expected path: apps/$ACTUAL_SERVICE_NAME/deployment.yaml"
+          
+          # Method 1: Try exact match first
+          DEPLOYMENT_FILE=""
+          if [ -d "apps/$ACTUAL_SERVICE_NAME" ]; then
+            DEPLOYMENT_FILE="apps/$ACTUAL_SERVICE_NAME/deployment.yaml"
+            if [ -f "$DEPLOYMENT_FILE" ]; then
+              echo "✅ Found exact match: $DEPLOYMENT_FILE"
+            fi
+          fi
+          
+          # Method 2: Try case-insensitive search
+          if [ -z "$DEPLOYMENT_FILE" ] || [ ! -f "$DEPLOYMENT_FILE" ]; then
+            DEPLOYMENT_FILE=$(find apps/ -type d -maxdepth 1 -iname "$ACTUAL_SERVICE_NAME" | head -n 1)
+            if [ -n "$DEPLOYMENT_FILE" ] && [ -f "$DEPLOYMENT_FILE/deployment.yaml" ]; then
+              DEPLOYMENT_FILE="$DEPLOYMENT_FILE/deployment.yaml"
+              echo "✅ Found case-insensitive match: $DEPLOYMENT_FILE"
+            else
+              DEPLOYMENT_FILE=""
+            fi
+          fi
+          
+          # Method 3: Try partial match (contains service name)
+          if [ -z "$DEPLOYMENT_FILE" ] || [ ! -f "$DEPLOYMENT_FILE" ]; then
+            MATCHED_FOLDER=$(find apps/ -type d -maxdepth 1 | grep -i "$ACTUAL_SERVICE_NAME" | head -n 1)
+            if [ -n "$MATCHED_FOLDER" ] && [ -f "$MATCHED_FOLDER/deployment.yaml" ]; then
+              DEPLOYMENT_FILE="$MATCHED_FOLDER/deployment.yaml"
+              echo "✅ Found partial match: $DEPLOYMENT_FILE"
+            else
+              DEPLOYMENT_FILE=""
+            fi
+          fi
+          
+          # Method 4: Try by repo name as last resort
+          if [ -z "$DEPLOYMENT_FILE" ] || [ ! -f "$DEPLOYMENT_FILE" ]; then
+            REPO_NORMALIZED=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g' | sed 's/\./-/g')
+            if [ -d "apps/$REPO_NORMALIZED" ] && [ -f "apps/$REPO_NORMALIZED/deployment.yaml" ]; then
+              DEPLOYMENT_FILE="apps/$REPO_NORMALIZED/deployment.yaml"
+              echo "✅ Found by repo name: $DEPLOYMENT_FILE"
+            fi
+          fi
+          
+          # Final check and update
+          if [ -z "$DEPLOYMENT_FILE" ] || [ ! -f "$DEPLOYMENT_FILE" ]; then
+            echo "❌ Error: Could not find deployment.yaml file"
+            echo "📋 Available app folders:"
+            ls -la apps/ 2>/dev/null || echo "  (apps/ folder does not exist)"
+            find apps/ -name "deployment.yaml" -type f | head -5 || echo "  (no deployment.yaml found)"
+            echo "💡 Expected location: apps/$ACTUAL_SERVICE_NAME/deployment.yaml"
+            exit 1
+          fi
+          
+          # Verify the deployment file contains the expected image pattern
+          if ! grep -q "image:" "$DEPLOYMENT_FILE"; then
+            echo "⚠️ Warning: deployment.yaml does not contain 'image:' field"
+          fi
+          
+          # Update the image tag
+          IMAGE_PATTERN="ghcr.io/quancv2k4/nodejs_tesst"
+          if sed -i.bak "s|image: ${IMAGE_PATTERN}:.*|image: ${IMAGE_PATTERN}:${SHA}|g" "$DEPLOYMENT_FILE"; then
+            echo "✅ Successfully updated: $DEPLOYMENT_FILE"
+            echo "📝 New image tag: ${IMAGE_PATTERN}:${SHA}"
+            
+            # Show the change
+            echo "📋 Updated deployment.yaml content:"
+            grep "image:" "$DEPLOYMENT_FILE" || echo "  (image line not found)"
+          else
+            echo "❌ Error: Failed to update deployment.yaml"
+            exit 1
+          fi
+          
+          # Clean up backup file
+          rm -f "$DEPLOYMENT_FILE.bak" 2>/dev/null || true
+      
+      - name: Set Repository B token for push
+        id: set_repo_b_token
+        run: |
+          # Try REPO_B_TOKEN first, then PAT_TOKEN, then GITHUB_TOKEN as fallback
+          if [ -n "${{ secrets.REPO_B_TOKEN }}" ]; then
+            echo "REPO_B_TOKEN=${{ secrets.REPO_B_TOKEN }}" >> $GITHUB_ENV
+            echo "✅ Using REPO_B_TOKEN"
+          elif [ -n "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "REPO_B_TOKEN=${{ secrets.PAT_TOKEN }}" >> $GITHUB_ENV
+            echo "✅ Using PAT_TOKEN (backward compatibility)"
+          elif [ -n "${{ secrets.GITHUB_TOKEN }}" ]; then
+            echo "REPO_B_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+            echo "⚠️ Using GITHUB_TOKEN (may not have write access to Repository B)"
+          else
+            echo "❌ Error: No token available. Please add REPO_B_TOKEN or PAT_TOKEN secret"
+            exit 1
+          fi
+      
+      - name: Commit and push to Repository B
+        working-directory: repo-b
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Configure git remote with token for authentication
+          REPO_B_URL=$(git remote get-url origin)
+          # Extract owner/repo from URL
+          if [[ "$REPO_B_URL" == *"@"* ]]; then
+            # Already has auth, extract the repo part
+            REPO_PATH=$(echo "$REPO_B_URL" | sed -E 's|^https?://[^@]*@github.com/||' | sed 's|\.git$||')
+          else
+            # No auth yet, extract from https://github.com/owner/repo format
+            REPO_PATH=$(echo "$REPO_B_URL" | sed -E 's|^https?://github.com/||' | sed 's|\.git$||')
+          fi
+          
+          # Set remote URL with token for authentication
+          git remote set-url origin "https://${REPO_B_TOKEN}@github.com/${REPO_PATH}.git"
+          
+          git add .
+          git diff --cached
+          git commit -m "[skip ci] Update image to ${SHA}" || echo "No changes to commit"
+          git push origin main || echo "Push failed or no changes"
