@@ -1,23 +1,54 @@
-# Node.js Backend
+# django_api
 
-Simple REST API backend built with Express.js.
+Django REST API Project được tạo tự động bởi **Dev Portal**.
 
-## Install Dependencies
+## 📋 Thông tin Project
+
+- **Project Name:** django_api
+- **App Name:** api
+- **Django Version:** 4.2.7
+- **DRF Version:** 3.14.0
+
+## 🚀 Models
+
+- **User**: users/
+
+## 📦 Installation
 
 ```bash
-npm install
+# Clone repository
+git clone https://github.com/quancv2k4/nodejs_tesst.git
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run migrations
+python manage.py makemigrations
+python manage.py migrate
+
+# Create superuser
+python manage.py createsuperuser
+
+# Run server
+python manage.py runserver
 ```
 
-## Run
+## 🐳 Docker
 
 ```bash
-npm start
+# Build image
+docker build -t django_api .
+
+# Run container
+docker run -p 8000:8000 django_api
 ```
 
-Server will start on http://localhost:3000
+## 🔗 API Endpoints
 
-## Endpoints
+- GET/POST `/api/users/` - List/Create User
+- GET/PUT/DELETE `/api/users/<id>/` - Detail/Update/Delete User
+- GET `/api/health/` - Health check
 
-- GET `/api/hello` - Hello message
-- GET `/api/users` - Get list of users
-- GET `/api/health` - Health check
+## 📝 License
+
+MIT License
